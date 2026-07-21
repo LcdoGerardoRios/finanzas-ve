@@ -29,11 +29,8 @@ st.set_page_config(
     layout="centered",  # "centered" se ve mejor en móvil que "wide"
 )
 
-CATEGORIAS = [
-    "Comida", "Transporte", "Servicios", "Salud", "Entretenimiento",
-    "Ropa", "Educación", "Deporte", "KÖMUN (negocio)", "Ahorro/Inversión",
-    "Otros",
-]
+# Las categorías ya no están fijas en el código: se administran desde la
+# tabla `categorias` y la pestaña "⚙️ Cuentas y Categorías" de la app.
 
 # ---------------------------------------------------------------------
 # Conexión a Supabase (cacheada)
@@ -77,6 +74,28 @@ def cargar_presupuestos() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
+def cargar_categorias() -> pd.DataFrame:
+    data = supabase.table("categorias").select("*").order("nombre").execute().data
+    return pd.DataFrame(data)
+
+
+def lista_categorias(tipo: str | None = None) -> list[str]:
+    """
+    Devuelve los nombres de categoría disponibles para un tipo dado
+    ('Gasto' o 'Ingreso'). Las categorías tipo 'Ambos' aplican a los dos.
+    Si la tabla está vacía, devuelve un fallback mínimo para que la app
+    no se rompa antes de que crees tu primera categoría.
+    """
+    cats = cargar_categorias()
+    if cats.empty:
+        return ["Otros"]
+    if tipo:
+        cats = cats[cats["tipo"].isin([tipo, "Ambos"])]
+    nombres = cats["nombre"].tolist()
+    return nombres if nombres else ["Otros"]
+
+
+@st.cache_data(ttl=30)
 def cargar_pagos_pendientes() -> pd.DataFrame:
     data = (
         supabase.table("pagos_programados")
@@ -116,25 +135,40 @@ def calcular_balances(cuentas: pd.DataFrame, transacciones: pd.DataFrame, tasa_b
       - balance_nativo: balance_inicial + movimientos netos en moneda nativa
       - balance_usd: balance_nativo convertido a USD
 
-    Nota sobre transferencias: al no existir cuenta destino en el
-    esquema, una 'Transferencia' se resta de la cuenta de origen
-    (igual que un gasto). Registra el ingreso en la cuenta destino
-    como una transacción tipo 'Ingreso' aparte.
+    Ingreso  -> suma a cuenta_id
+    Gasto    -> resta de cuenta_id
+    Transferencia -> resta monto_original de cuenta_id (origen) y suma
+                     monto_destino a cuenta_destino_id (destino). Si
+                     origen y destino tienen la misma moneda, monto_destino
+                     normalmente es igual a monto_original; si son monedas
+                     distintas (ej. compra de dólares), monto_destino ya
+                     viene convertido con la tasa que el usuario indicó.
     """
     cuentas = cuentas.copy()
-    cuentas["balance_nativo"] = cuentas["balance_inicial"].astype(float)
+    ajustes: dict[int, float] = {}
 
     if not transacciones.empty:
-        signo = transacciones["tipo"].map(
-            {"Ingreso": 1, "Gasto": -1, "Transferencia": -1}
-        ).fillna(0)
-        movimiento = transacciones["monto_original"].astype(float) * signo
-        neto_por_cuenta = movimiento.groupby(transacciones["cuenta_id"]).sum()
+        for _, t in transacciones.iterrows():
+            tipo = t["tipo"]
+            cuenta_id = t["cuenta_id"]
+            monto = float(t["monto_original"])
 
-        cuentas["balance_nativo"] = cuentas.apply(
-            lambda row: row["balance_nativo"] + neto_por_cuenta.get(row["id"], 0),
-            axis=1,
-        )
+            if tipo == "Ingreso":
+                ajustes[cuenta_id] = ajustes.get(cuenta_id, 0.0) + monto
+            elif tipo == "Gasto":
+                ajustes[cuenta_id] = ajustes.get(cuenta_id, 0.0) - monto
+            elif tipo == "Transferencia":
+                ajustes[cuenta_id] = ajustes.get(cuenta_id, 0.0) - monto
+                destino = t.get("cuenta_destino_id")
+                monto_destino = t.get("monto_destino")
+                if pd.notna(destino) and pd.notna(monto_destino):
+                    destino = int(destino)
+                    ajustes[destino] = ajustes.get(destino, 0.0) + float(monto_destino)
+
+    cuentas["balance_nativo"] = cuentas.apply(
+        lambda row: float(row["balance_inicial"]) + ajustes.get(row["id"], 0.0),
+        axis=1,
+    )
 
     def a_usd(row):
         if row["moneda_nativa"] == "USD":
@@ -152,8 +186,8 @@ def calcular_balances(cuentas: pd.DataFrame, transacciones: pd.DataFrame, tasa_b
 # ---------------------------------------------------------------------
 st.title("💰 Finanzas VE")
 
-tab_dashboard, tab_presupuestos, tab_pagos, tab_ia = st.tabs(
-    ["📊 Dashboard", "🎯 Presupuestos", "📅 Pagos", "🤖 Asistente IA"]
+tab_dashboard, tab_presupuestos, tab_pagos, tab_mover, tab_ia, tab_ajustes = st.tabs(
+    ["📊 Dashboard", "🎯 Presupuestos", "📅 Pagos", "🔄 Mover dinero", "🤖 Asistente IA", "⚙️ Ajustes"]
 )
 
 # =======================================================================
@@ -261,7 +295,7 @@ with tab_presupuestos:
 
     with st.expander("➕ Nuevo presupuesto"):
         with st.form("form_nuevo_presupuesto"):
-            categoria = st.selectbox("Categoría", CATEGORIAS)
+            categoria = st.selectbox("Categoría", lista_categorias())
             monto_limite = st.number_input("Límite (USD)", min_value=0.0, step=5.0)
             periodo = st.selectbox("Periodo", ["Semanal", "Mensual"])
             if st.form_submit_button("Crear presupuesto"):
@@ -337,7 +371,7 @@ with tab_pagos:
             monto = st.number_input("Monto", min_value=0.0, step=1.0)
             moneda = st.selectbox("Moneda", ["VES", "USD", "EUR"])
             fecha_venc = st.date_input("Fecha de vencimiento", min_value=datetime.date.today())
-            categoria = st.selectbox("Categoría", CATEGORIAS, key="cat_pago")
+            categoria = st.selectbox("Categoría", lista_categorias("Gasto"), key="cat_pago")
             cuenta_sel = None
             if not cuentas.empty:
                 cuenta_sel = st.selectbox(
@@ -364,7 +398,99 @@ with tab_pagos:
 
 
 # =======================================================================
-# MÓDULO 4 · ASISTENTE IA (Gemini) — texto libre / foto de factura
+# MÓDULO 4 · MOVER DINERO (transferencias entre cuentas y compra/venta
+# de dólares). Una compra de dólares es, en el fondo, una transferencia
+# entre una cuenta VES y una cuenta USD con una tasa de conversión que
+# tú indicas manualmente (porque la tasa paralela varía mucho y no
+# siempre coincide con la del BCV).
+# =======================================================================
+with tab_mover:
+    st.subheader("Transferencia entre cuentas / Compra o venta de dólares")
+
+    cuentas = cargar_cuentas()
+
+    if len(cuentas) < 2:
+        st.info("Necesitas al menos 2 cuentas creadas para transferir entre ellas. Créalas en ⚙️ Ajustes.")
+    else:
+        nombres_cuentas = cuentas["nombre"].tolist()
+
+        col_o, col_d = st.columns(2)
+        with col_o:
+            origen_nombre = st.selectbox("Cuenta origen (de dónde sale)", nombres_cuentas, key="mover_origen")
+        with col_d:
+            opciones_destino = [n for n in nombres_cuentas if n != origen_nombre]
+            destino_nombre = st.selectbox("Cuenta destino (a dónde entra)", opciones_destino, key="mover_destino")
+
+        origen = cuentas.loc[cuentas["nombre"] == origen_nombre].iloc[0]
+        destino = cuentas.loc[cuentas["nombre"] == destino_nombre].iloc[0]
+
+        monto_origen = st.number_input(
+            f"Monto que sale de {origen_nombre} ({origen['moneda_nativa']})",
+            min_value=0.0, step=1.0, key="mover_monto_origen",
+        )
+
+        monto_destino_final = monto_origen  # por defecto: sin conversión
+        tasa_conversion = None
+
+        if origen["moneda_nativa"] != destino["moneda_nativa"]:
+            st.caption(
+                f"⚠️ {origen_nombre} es {origen['moneda_nativa']} y {destino_nombre} es "
+                f"{destino['moneda_nativa']} — indica la tasa que usaste en esta operación "
+                "(la del mercado paralelo suele variar, así que no se asume la del BCV)."
+            )
+            tasa_conversion = st.number_input(
+                "Tasa de conversión usada (VES por 1 USD)",
+                min_value=0.0, step=0.5, key="mover_tasa",
+            )
+            if tasa_conversion and tasa_conversion > 0:
+                if origen["moneda_nativa"] == "VES":
+                    monto_destino_final = round(monto_origen / tasa_conversion, 2)
+                else:
+                    monto_destino_final = round(monto_origen * tasa_conversion, 2)
+
+        monto_destino_final = st.number_input(
+            f"Monto que entra a {destino_nombre} ({destino['moneda_nativa']}) — puedes ajustarlo (ej. si hubo comisión)",
+            min_value=0.0, step=1.0, value=float(monto_destino_final), key="mover_monto_destino",
+        )
+
+        categoria_mov = st.selectbox(
+            "Categoría (opcional, útil para compra/venta de divisas)",
+            lista_categorias(), key="mover_categoria",
+        )
+        nota_mov = st.text_input("Nota (opcional)", key="mover_nota")
+
+        if st.button("💸 Registrar movimiento", key="btn_mover"):
+            if monto_origen <= 0 or monto_destino_final <= 0:
+                st.error("El monto debe ser mayor a 0.")
+            else:
+                payload = {
+                    "cuenta_id": int(origen["id"]),
+                    "tipo": "Transferencia",
+                    "categoria": categoria_mov,
+                    "monto_original": monto_origen,
+                    "moneda_original": origen["moneda_nativa"],
+                    "notas": nota_mov,
+                    "cuenta_destino_id": int(destino["id"]),
+                    "monto_destino": monto_destino_final,
+                }
+                # Si hubo conversión manual, se pasa la tasa para que el
+                # trigger calcule monto_usd correctamente (en vez de usar
+                # la última tasa BCV, que puede no reflejar el mercado
+                # paralelo del momento).
+                if tasa_conversion:
+                    payload["tasa_usada"] = tasa_conversion
+
+                supabase.table("transacciones").insert(payload).execute()
+                limpiar_cache()
+                st.success(
+                    f"✅ Movido: {monto_origen} {origen['moneda_nativa']} ({origen_nombre}) → "
+                    f"{monto_destino_final} {destino['moneda_nativa']} ({destino_nombre})"
+                )
+                st.rerun()
+
+
+# =======================================================================
+# MÓDULO 5 · ASISTENTE IA (Gemini) — texto libre / foto de factura
 # =======================================================================
 with tab_ia:
     st.subheader("Registrar con IA (texto o comprobante)")
@@ -384,7 +510,7 @@ Eres un asistente que extrae datos de una transacción financiera a partir de
 texto libre en español (puede venir de una nota de voz transcrita) o del
 texto de una factura/comprobante.
 
-Categorías válidas: {CATEGORIAS}
+Categorías válidas: {lista_categorias()}
 Cuentas disponibles: {cuentas['nombre'].tolist() if not cuentas.empty else []}
 
 Responde ÚNICAMENTE con un JSON válido, sin texto adicional, sin backticks,
@@ -453,10 +579,11 @@ con esta forma exacta:
                     index=["VES", "USD", "EUR"].index(borrador.get("moneda_original", "USD"))
                     if borrador.get("moneda_original") in ["VES", "USD", "EUR"] else 1,
                 )
+                categorias_disp = lista_categorias(tipo)
                 categoria = st.selectbox(
-                    "Categoría", CATEGORIAS,
-                    index=CATEGORIAS.index(borrador["categoria"])
-                    if borrador.get("categoria") in CATEGORIAS else len(CATEGORIAS) - 1,
+                    "Categoría", categorias_disp,
+                    index=categorias_disp.index(borrador["categoria"])
+                    if borrador.get("categoria") in categorias_disp else len(categorias_disp) - 1,
                 )
                 cuenta_sel = None
                 if not cuentas.empty:
@@ -482,3 +609,91 @@ con esta forma exacta:
                     limpiar_cache()
                     st.success("Transacción guardada. ✅")
                     st.rerun()
+
+
+# =======================================================================
+# MÓDULO 6 · AJUSTES (crear cuentas y administrar categorías, sin SQL)
+# =======================================================================
+with tab_ajustes:
+    st.subheader("Cuentas")
+
+    cuentas = cargar_cuentas()
+    if not cuentas.empty:
+        st.dataframe(
+            cuentas[["nombre", "moneda_nativa", "balance_inicial"]],
+            hide_index=True, use_container_width=True,
+        )
+    else:
+        st.info("Todavía no tienes cuentas creadas.")
+
+    with st.expander("➕ Nueva cuenta"):
+        with st.form("form_nueva_cuenta"):
+            nombre_cuenta = st.text_input("Nombre (ej: Banesco, Binance, Efectivo USD)")
+            moneda_cuenta = st.selectbox("Moneda de la cuenta", ["VES", "USD", "EUR"])
+            balance_inicial = st.number_input("Balance inicial (en esa moneda)", step=1.0)
+            if st.form_submit_button("Crear cuenta"):
+                if not nombre_cuenta.strip():
+                    st.error("El nombre no puede estar vacío.")
+                elif not cuentas.empty and nombre_cuenta.strip() in cuentas["nombre"].values:
+                    st.error(f"Ya existe una cuenta llamada '{nombre_cuenta.strip()}'.")
+                else:
+                    supabase.table("cuentas").insert(
+                        {
+                            "nombre": nombre_cuenta.strip(),
+                            "moneda_nativa": moneda_cuenta,
+                            "balance_inicial": balance_inicial,
+                        }
+                    ).execute()
+                    limpiar_cache()
+                    st.success(f"Cuenta '{nombre_cuenta.strip()}' creada.")
+                    st.rerun()
+
+    st.divider()
+    st.subheader("Categorías")
+
+    categorias_df = cargar_categorias()
+    if not categorias_df.empty:
+        st.dataframe(
+            categorias_df[["nombre", "tipo"]],
+            hide_index=True, use_container_width=True,
+        )
+    else:
+        st.info("Todavía no tienes categorías creadas.")
+
+    with st.expander("➕ Nueva categoría"):
+        with st.form("form_nueva_categoria"):
+            nombre_cat = st.text_input("Nombre de la categoría")
+            tipo_cat = st.selectbox(
+                "¿Para qué aplica?", ["Ambos", "Gasto", "Ingreso"],
+                help="'Ambos' hace que aparezca tanto al registrar gastos como ingresos.",
+            )
+            if st.form_submit_button("Crear categoría"):
+                if not nombre_cat.strip():
+                    st.error("El nombre no puede estar vacío.")
+                elif not categorias_df.empty and nombre_cat.strip() in categorias_df["nombre"].values:
+                    st.error(f"Ya existe la categoría '{nombre_cat.strip()}'.")
+                else:
+                    supabase.table("categorias").insert(
+                        {"nombre": nombre_cat.strip(), "tipo": tipo_cat}
+                    ).execute()
+                    limpiar_cache()
+                    st.success(f"Categoría '{nombre_cat.strip()}' creada.")
+                    st.rerun()
+
+    with st.expander("🗑️ Eliminar una categoría"):
+        if categorias_df.empty:
+            st.caption("No hay categorías para eliminar.")
+        else:
+            cat_a_borrar = st.selectbox(
+                "Selecciona la categoría a eliminar", categorias_df["nombre"].tolist(),
+                key="cat_borrar",
+            )
+            st.caption(
+                "⚠️ Esto no borra transacciones/presupuestos ya creados con esa "
+                "categoría, solo evita que siga apareciendo como opción nueva."
+            )
+            if st.button("Eliminar categoría", key="btn_borrar_cat"):
+                supabase.table("categorias").delete().eq("nombre", cat_a_borrar).execute()
+                limpiar_cache()
+                st.success(f"Categoría '{cat_a_borrar}' eliminada.")
+                st.rerun()
