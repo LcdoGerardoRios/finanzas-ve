@@ -122,6 +122,20 @@ def ultima_tasa_bcv() -> float | None:
     return float(data[0]["valor_usd"]) if data else None
 
 
+@st.cache_data(ttl=300)
+def ultima_tasa_binance() -> float | None:
+    data = (
+        supabase.table("tasas_cambio")
+        .select("valor_usd")
+        .eq("tipo_tasa", "Binance")
+        .order("fecha", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return float(data[0]["valor_usd"]) if data else None
+
+
 def limpiar_cache():
     st.cache_data.clear()
 
@@ -186,8 +200,28 @@ def calcular_balances(cuentas: pd.DataFrame, transacciones: pd.DataFrame, tasa_b
 # ---------------------------------------------------------------------
 st.title("💰 Finanzas VE")
 
-tab_dashboard, tab_presupuestos, tab_pagos, tab_mover, tab_ia, tab_ajustes = st.tabs(
-    ["📊 Dashboard", "🎯 Presupuestos", "📅 Pagos", "🔄 Mover dinero", "🤖 Asistente IA", "⚙️ Ajustes"]
+# Recordatorio visual: se muestra apenas abres la app si hay pagos
+# programados venciendo hoy o en los próximos 3 días. Es un recordatorio
+# "al abrir la app" — para avisos aunque no la abras, sigue llegando el
+# mensaje diario de Telegram (bot_y_tasas.py en GitHub Actions).
+_pagos_para_banner = cargar_pagos_pendientes()
+if not _pagos_para_banner.empty:
+    _hoy_banner = datetime.date.today()
+    _limite_banner = _hoy_banner + datetime.timedelta(days=3)
+    _pagos_para_banner["fecha_vencimiento"] = pd.to_datetime(_pagos_para_banner["fecha_vencimiento"]).dt.date
+    _proximos = _pagos_para_banner[
+        (_pagos_para_banner["fecha_vencimiento"] >= _hoy_banner)
+        & (_pagos_para_banner["fecha_vencimiento"] <= _limite_banner)
+    ]
+    if not _proximos.empty:
+        _lineas = [
+            f"• **{p['descripcion']}** vence {p['fecha_vencimiento'].strftime('%d/%m')}"
+            for _, p in _proximos.iterrows()
+        ]
+        st.warning("⏰ **Tienes pagos por vencer:**\n\n" + "\n\n".join(_lineas))
+
+tab_dashboard, tab_registrar, tab_presupuestos, tab_pagos, tab_mover, tab_ia, tab_ajustes = st.tabs(
+    ["📊 Dashboard", "➕ Registrar", "🎯 Presupuestos", "📅 Pagos", "🔄 Mover dinero", "🤖 Asistente IA", "⚙️ Ajustes"]
 )
 
 # =======================================================================
@@ -236,6 +270,82 @@ with tab_dashboard:
         if st.button("🔄 Refrescar datos"):
             limpiar_cache()
             st.rerun()
+
+
+# =======================================================================
+# MÓDULO · REGISTRAR (gasto o ingreso manual, con selector de tasa)
+# =======================================================================
+with tab_registrar:
+    st.subheader("Registrar gasto o ingreso")
+
+    cuentas = cargar_cuentas()
+    tasa_bcv = ultima_tasa_bcv()
+    tasa_binance = ultima_tasa_binance()
+
+    if cuentas.empty:
+        st.warning("Primero crea una cuenta en ⚙️ Ajustes.")
+    else:
+        tipo_reg = st.radio("Tipo", ["Gasto", "Ingreso"], horizontal=True, key="reg_tipo")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            cuenta_reg_nombre = st.selectbox("Cuenta", cuentas["nombre"].tolist(), key="reg_cuenta")
+        with col2:
+            moneda_reg = st.selectbox("Moneda", ["VES", "USD", "EUR"], key="reg_moneda")
+
+        monto_reg = st.number_input("Monto", min_value=0.0, step=1.0, key="reg_monto")
+        categoria_reg = st.selectbox("Categoría", lista_categorias(tipo_reg), key="reg_categoria")
+        nota_reg = st.text_input("Nota (opcional)", key="reg_nota")
+
+        # ---- Selector de tasa: solo aplica si la moneda no es USD ----
+        tasa_reg = None
+        if moneda_reg != "USD":
+            opciones_tasa = []
+            if tasa_bcv:
+                opciones_tasa.append(f"BCV ({tasa_bcv:,.2f})")
+            if tasa_binance:
+                opciones_tasa.append(f"Binance ({tasa_binance:,.2f})")
+            opciones_tasa.append("Manual")
+
+            eleccion_tasa = st.radio(
+                "¿Qué tasa quieres usar para calcular el equivalente en USD?",
+                opciones_tasa, horizontal=True, key="reg_tasa_tipo",
+            )
+
+            if eleccion_tasa.startswith("BCV"):
+                tasa_reg = tasa_bcv
+            elif eleccion_tasa.startswith("Binance"):
+                tasa_reg = tasa_binance
+            else:
+                tasa_reg = st.number_input(
+                    "Tasa manual (VES por 1 USD)", min_value=0.0, step=0.5, key="reg_tasa_manual",
+                )
+
+            if tasa_reg:
+                st.caption(f"≈ US$ {monto_reg / tasa_reg:,.2f}" if tasa_reg > 0 else "")
+
+        if st.button("💾 Registrar", key="btn_registrar", type="primary"):
+            if monto_reg <= 0:
+                st.error("El monto debe ser mayor a 0.")
+            elif moneda_reg != "USD" and not tasa_reg:
+                st.error("Indica una tasa válida (o registra primero una tasa BCV/Binance).")
+            else:
+                cuenta_id_reg = int(cuentas.loc[cuentas["nombre"] == cuenta_reg_nombre, "id"].iloc[0])
+                payload = {
+                    "cuenta_id": cuenta_id_reg,
+                    "tipo": tipo_reg,
+                    "categoria": categoria_reg,
+                    "monto_original": monto_reg,
+                    "moneda_original": moneda_reg,
+                    "notas": nota_reg,
+                }
+                if moneda_reg != "USD":
+                    payload["tasa_usada"] = tasa_reg
+
+                supabase.table("transacciones").insert(payload).execute()
+                limpiar_cache()
+                st.success(f"✅ {tipo_reg} de {monto_reg} {moneda_reg} registrado en {categoria_reg}.")
+                st.rerun()
 
 
 # =======================================================================
@@ -317,51 +427,38 @@ with tab_presupuestos:
 # =======================================================================
 with tab_pagos:
     st.subheader("Pagos programados (pendientes)")
+    st.caption(
+        "Esta sección es solo para llevar tus fechas de compromiso y recibir "
+        "recordatorios. Marcar como pagado NO registra ningún gasto — eso lo "
+        "haces tú mismo en la pestaña ➕ Registrar cuando hagas el pago real."
+    )
 
     pagos = cargar_pagos_pendientes()
-    cuentas = cargar_cuentas()
 
     if pagos.empty:
         st.info("No tienes pagos pendientes registrados. 🎉")
     else:
         for _, pago in pagos.iterrows():
             vence = pd.to_datetime(pago["fecha_vencimiento"]).date()
-            dias_restantes = (vence - hoy).days if 'hoy' in dir() else (vence - datetime.date.today()).days
+            dias_restantes = (vence - datetime.date.today()).days
 
             urgencia = "🔴" if dias_restantes <= 3 else ("🟡" if dias_restantes <= 7 else "🟢")
 
             col1, col2 = st.columns([3, 1])
             with col1:
                 st.write(f"{urgencia} **{pago['descripcion']}**")
+                monto_usd_txt = f" (≈ US$ {pago['monto_usd']:,.2f})" if pd.notna(pago.get("monto_usd")) else ""
                 st.caption(
-                    f"{pago['monto_original']} {pago['moneda_original']} "
-                    f"(≈ US$ {pago['monto_usd']:,.2f})  ·  Vence: {vence.strftime('%d/%m/%Y')}"
+                    f"{pago['monto_original']} {pago['moneda_original']}{monto_usd_txt}"
+                    f"  ·  Vence: {vence.strftime('%d/%m/%Y')}  ·  Categoría: {pago['categoria']}"
                 )
             with col2:
                 if st.button("✅ Pagado", key=f"pagar_{pago['id']}"):
-                    cuenta_id = pago["cuenta_id"]
-                    if pd.isna(cuenta_id) and not cuentas.empty:
-                        cuenta_id = int(cuentas.iloc[0]["id"])
-
-                    # 1. Crear la transacción de gasto correspondiente
-                    supabase.table("transacciones").insert(
-                        {
-                            "cuenta_id": int(cuenta_id),
-                            "tipo": "Gasto",
-                            "categoria": pago["categoria"],
-                            "monto_original": float(pago["monto_original"]),
-                            "moneda_original": pago["moneda_original"],
-                            "notas": f"Pago programado: {pago['descripcion']}",
-                        }
-                    ).execute()
-
-                    # 2. Marcar el pago programado como Pagado
                     supabase.table("pagos_programados").update(
                         {"estado": "Pagado"}
                     ).eq("id", int(pago["id"])).execute()
-
                     limpiar_cache()
-                    st.success("Pago registrado como gasto. ✅")
+                    st.success("Marcado como pagado. Recuerda registrar el gasto en ➕ Registrar.")
                     st.rerun()
             st.divider()
 
@@ -372,16 +469,7 @@ with tab_pagos:
             moneda = st.selectbox("Moneda", ["VES", "USD", "EUR"])
             fecha_venc = st.date_input("Fecha de vencimiento", min_value=datetime.date.today())
             categoria = st.selectbox("Categoría", lista_categorias("Gasto"), key="cat_pago")
-            cuenta_sel = None
-            if not cuentas.empty:
-                cuenta_sel = st.selectbox(
-                    "Cuenta de pago", cuentas["nombre"], key="cuenta_pago"
-                )
             if st.form_submit_button("Guardar pago programado"):
-                cuenta_id = None
-                if cuenta_sel is not None:
-                    cuenta_id = int(cuentas.loc[cuentas["nombre"] == cuenta_sel, "id"].iloc[0])
-
                 supabase.table("pagos_programados").insert(
                     {
                         "descripcion": descripcion,
@@ -389,7 +477,6 @@ with tab_pagos:
                         "moneda_original": moneda,
                         "fecha_vencimiento": fecha_venc.isoformat(),
                         "categoria": categoria,
-                        "cuenta_id": cuenta_id,
                     }
                 ).execute()
                 limpiar_cache()
@@ -626,6 +713,31 @@ with tab_ajustes:
     else:
         st.info("Todavía no tienes cuentas creadas.")
 
+    with st.expander("✏️ Editar saldo inicial de una cuenta"):
+        if cuentas.empty:
+            st.caption("No hay cuentas todavía.")
+        else:
+            st.caption(
+                "El **saldo inicial** es el punto de partida de la cuenta (antes de "
+                "que existiera cualquier transacción en la app). Cambiarlo aquí NO "
+                "crea ninguna transacción, solo ajusta el balance base."
+            )
+            cuenta_editar_nombre = st.selectbox(
+                "Cuenta", cuentas["nombre"].tolist(), key="editar_cuenta_sel"
+            )
+            cuenta_editar = cuentas.loc[cuentas["nombre"] == cuenta_editar_nombre].iloc[0]
+            nuevo_balance = st.number_input(
+                f"Saldo inicial de {cuenta_editar_nombre} ({cuenta_editar['moneda_nativa']})",
+                step=1.0, value=float(cuenta_editar["balance_inicial"]), key="editar_cuenta_balance",
+            )
+            if st.button("Guardar saldo inicial", key="btn_editar_cuenta"):
+                supabase.table("cuentas").update(
+                    {"balance_inicial": nuevo_balance}
+                ).eq("id", int(cuenta_editar["id"])).execute()
+                limpiar_cache()
+                st.success(f"Saldo inicial de '{cuenta_editar_nombre}' actualizado a {nuevo_balance}.")
+                st.rerun()
+
     with st.expander("➕ Nueva cuenta"):
         with st.form("form_nueva_cuenta"):
             nombre_cuenta = st.text_input("Nombre (ej: Banesco, Binance, Efectivo USD)")
@@ -653,6 +765,11 @@ with tab_ajustes:
 
     categorias_df = cargar_categorias()
     if not categorias_df.empty:
+        st.caption(
+            "El **tipo** define dónde aparece disponible cada categoría: "
+            "'Gasto' solo al registrar gastos, 'Ingreso' solo al registrar "
+            "ingresos, y 'Ambos' en los dos casos."
+        )
         st.dataframe(
             categorias_df[["nombre", "tipo"]],
             hide_index=True, use_container_width=True,
